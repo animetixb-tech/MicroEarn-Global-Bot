@@ -11,7 +11,7 @@ from telebot import TeleBot, types
 # ==============================================================================
 BOT_TOKEN = "8867404798:AAHrhmSJ2kPCi7-FxIp37m4Gk9ggqYGs0FU"
 OWNER_ID = 7736281687
-OFFICIAL_CHANNEL = "https://t.me/+E4_9Pwicnj9kMmQ1"
+OFFICIAL_CHANNEL = "MicroEarn Global"
 DB_FILE = "microearn_global.db"
 
 bot = TeleBot(BOT_TOKEN)
