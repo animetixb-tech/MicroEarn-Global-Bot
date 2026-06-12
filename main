@@ -1,0 +1,834 @@
+import os
+import sqlite3
+import time
+import csv
+import random
+import string
+from telebot import TeleBot, types
+
+# ==============================================================================
+# SECURITY GRID CONFIGURATION & OWNER HARD-LOCKING
+# ==============================================================================
+BOT_TOKEN = "8867404798:AAHrhmSJ2kPCi7-FxIp37m4Gk9ggqYGs0FU"
+OWNER_ID = 7736281687
+OFFICIAL_CHANNEL = "https://t.me/+E4_9Pwicnj9kMmQ1"
+DB_FILE = "microearn_global.db"
+
+bot = TeleBot(BOT_TOKEN)
+
+# Runtime state storage for multi-step input handling
+user_states = {}
+
+# ==============================================================================
+# DATABASE ENGINE AND LAYER SEEDING
+# ==============================================================================
+def init_db():
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            first_name TEXT,
+            balance REAL DEFAULT 0.0,
+            lang TEXT DEFAULT 'BN',
+            referred_by INTEGER DEFAULT 0
+        )
+    ''')
+    
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS submissions (
+            sub_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            task_main TEXT,
+            task_sub TEXT,
+            username TEXT,
+            password TEXT,
+            recovery TEXT,
+            tfa_key TEXT DEFAULT 'N/A',
+            cookies TEXT DEFAULT 'N/A',
+            status TEXT DEFAULT 'Pending',
+            timestamp INTEGER
+        )
+    ''')
+    
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS withdraws (
+            w_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            method TEXT,
+            amount REAL,
+            address TEXT,
+            txn_id TEXT DEFAULT 'N/A',
+            status TEXT DEFAULT 'Pending',
+            timestamp INTEGER
+        )
+    ''')
+    
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS rates (
+            platform TEXT PRIMARY KEY,
+            price REAL,
+            logo TEXT,
+            custom_fields TEXT DEFAULT 'N/A'
+        )
+    ''')
+    
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS admins (
+            admin_id INTEGER PRIMARY KEY,
+            assigned_by INTEGER,
+            role TEXT DEFAULT 'Assistant'
+        )
+    ''')
+    
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS support_links (
+            link_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            channel_name TEXT,
+            url TEXT
+        )
+    ''')
+    
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS dynamic_settings (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+    ''')
+    
+    # Baseline Platform Seeding (In BDT and matching interface design layout)
+    platforms = [
+        ('Gmail', 25.0, '📧'),
+        ('FB_Hotmail', 6.0, '🟦 Hotmail'),
+        ('FB_Cookies', 4.0, '🍪 Cookies'),
+        ('Instagram', 6.0, '📸'),
+        ('Twitter', 8.0, '𝕏'),
+        ('TikTok', 7.0, '🎵'),
+        ('YouTube', 10.0, '🎬')
+    ]
+    for plat, price, logo in platforms:
+        cursor.execute("INSERT OR IGNORE INTO rates (platform, price, logo) VALUES (?, ?, ?)", (plat, price, logo))
+        
+    # Global Dynamic Variables Configuration
+    settings = [
+        ('min_recharge', '40.0'),
+        ('min_bkash_nagad', '60.0'),
+        ('min_binance_usd', '1.00'),
+        ('usd_rate', '120.0'),
+        ('ref_commission', '0.50'),
+        ('tutorial_video', 'https://youtube.com'),
+        ('owner_id', str(OWNER_ID))
+    ]
+    for key, val in settings:
+        cursor.execute("INSERT OR IGNORE INTO dynamic_settings (key, value) VALUES (?, ?)", (key, val))
+        
+    # Owner Hard-Lock Injection Into Admin Layer
+    cursor.execute("INSERT OR IGNORE INTO admins (admin_id, assigned_by, role) VALUES (?, ?, 'Owner')", (OWNER_ID, OWNER_ID, 'Owner'))
+    
+    # Baseline Multi-Support Links Setup
+    cursor.execute("SELECT COUNT(*) FROM support_links")
+    if cursor.fetchone()[0] == 0:
+        cursor.execute("INSERT INTO support_links (channel_name, url) VALUES (?, ?)", ('Main Support', 'https://t.me/your_support'))
+        
+    conn.commit()
+    conn.close()
+
+# Helper to fetch settings safely
+def get_setting(key):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("SELECT value FROM dynamic_settings WHERE key=?", (key,))
+    row = cursor.fetchone()
+    conn.close()
+    return row[0] if row else "0"
+
+# Helper to check sequential spam rejections
+def is_spammer(user_id):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("SELECT status FROM submissions WHERE user_id=? ORDER BY sub_id DESC LIMIT 5", (user_id,))
+    rows = cursor.fetchall()
+    conn.close()
+    if len(rows) == 5 and all(r[0] == 'Rejected' for r in rows):
+        return True
+    return False
+
+# Helper to look up language dictionary values
+def msg(key, lang):
+    dict_bn = {
+        'welcome': "👋 আমাদের মাইক্রো-টাস্ক বটে আপনাকে স্বাগতম!\nএখানে আপনি বিভিন্ন সোশ্যাল মিডিয়া অ্যাকাউন্ট খুলে প্রতিদিন ইনকাম করতে পারবেন।\n\nঅনুগ্রহ করে নিচের মেনু থেকে অপশন সিলেক্ট করুন।",
+        'welcome_en': "👋 Welcome to our Micro-task Bot!\nHere you can earn daily by creating various social media accounts.\n\nPlease select an option from the menu below.",
+        'main_menu': "🔙 আপনি প্রধান মেনুতে ফিরে এসেছেন।",
+        'balance': "💰 আপনার অ্যাকাউন্ট ব্যালেন্স:\n\n💵 টাকা: ৳ {:.2f} BDT\n💵 ডলার: $ {:.2f} USD",
+        'with_err': "❌ আপনার ব্যালেন্স অপর্যাপ্ত!",
+        'with_select': "💳 উইথড্র করার মাধ্যম সিলেক্ট করুন:",
+        'with_input': "✍️ আপনার উইথড্র নাম্বার/অ্যাড্রেস এবং পরিমাণ দিন।\nফরম্যাট: [অ্যাড্রেস] [পরিমাণ]\nউদাহরণ: 01700000000 100",
+        'with_success': "✅ উইথড্র রিকোয়েস্ট জমা হয়েছে! অ্যাডমিন ২৪ ঘণ্টার মধ্যে ভেরিফাই করে পেমেন্ট করে দেবে।",
+        'task_list': "📋 বর্তমানে চালু থাকা কাজের তালিকা:",
+        'cancel': "❌ অপারেশন বাতিল করা হয়েছে।",
+        'invite': "🔗 আপনার বন্ধুদের ইনভাইট করুন এবং বোনাস পান!\n\n🎁 প্রতি সফল রেফারে পাবেন: ৳ {} BDT\n\n🎯 আপনার রেফার লিংক:\nhttps://t.me/{}?start={}\n\n👥 আপনার রেফারে যারা জয়েন করেছে:\n{}",
+        'proof_err': "❌ ভুল সাবমিশন! সিস্টেম কোড মিলছে না। কাজ রিজেক্ট করা হয়েছে।",
+        'spam_lock': "🚫 আপনি পরপর ৫ বার ভুল কাজ জমা দিয়েছেন! স্প্যামিং রোধে আপনার আইডি সাময়িকভাবে ব্লক করা হয়েছে।",
+        'sub_success': "📥 আপনার টাস্ক ডাটা সফলভাবে জমা হয়েছে! অ্যাডমিন ভেরিফাই করে ২৪ ঘণ্টার মধ্যে ব্যালেন্স অ্যাড করে দেবে।"
+    }
+    return dict_bn[key] if lang == 'BN' else dict_bn.get(key + '_en', dict_bn[key])
+
+# ==============================================================================
+# SYSTEM INTERFACE LOGIC & MAIN LAYOUT GENERATORS
+# ==============================================================================
+def get_main_keyboard(lang):
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    if lang == 'BN':
+        markup.row('📋 Tasks / কাজ', '💰 Balance / ব্যালেন্স', '💳 Withdraw / উইথড্র')
+        markup.row('📊 My Report / রিপোর্ট', '🔗 Invite Link / রেফার', '🧾 Proof List / প্রুফ লিস্ট')
+        markup.row('📖 How to Work / ভিডিও গাইড', '📞 Helpline / সাপোর্ট')
+    else:
+        markup.row('📋 Tasks / काम', '💰 Balance', '💳 Withdraw')
+        markup.row('📊 My Report', '🔗 Invite Link', '🧾 Proof List')
+        markup.row('📖 How to Work', '📞 Helpline')
+    return markup
+
+def get_cancel_keyboard(lang):
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    markup.add('❌ বাতিল করুন / Cancel')
+    return markup
+
+# ==============================================================================
+# TELEGRAM INCOMING COMMAND ENGINE ROUTER
+# ==============================================================================
+@bot.message_with_type_handler(commands=['start'], content_types=['text'])
+def send_welcome(message):
+    user_id = message.from_user.id
+    first_name = message.from_user.first_name
+    
+    # Handle deep-linking referral structure logic
+    args = message.text.split()
+    referrer = 0
+    if len(args) > 1 and args[1].isdigit():
+        referrer = int(args[1])
+        if referrer == user_id:
+            referrer = 0
+
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("SELECT lang FROM users WHERE user_id=?", (user_id,))
+    row = cursor.fetchone()
+    
+    if not row:
+        cursor.execute("INSERT INTO users (user_id, first_name, referred_by) VALUES (?, ?, ?)", (user_id, first_name, referrer))
+        conn.commit()
+        
+        # Display language gate selection buttons on fresh entry
+        markup = types.InlineKeyboardMarkup()
+        markup.row(
+            types.InlineKeyboardButton("🇧🇩 বাংলা", callback_data="setlang_BN"),
+            types.InlineKeyboardButton("🇺🇸 English", callback_data="setlang_EN")
+        )
+        bot.send_message(user_id, "🎯 Please select your preferred language / ভাষা নির্বাচন করুন:", reply_markup=markup)
+    else:
+        lang = row[0]
+        bot.send_message(user_id, msg('welcome', lang), reply_markup=get_main_keyboard(lang))
+    conn.close()
+
+# ==============================================================================
+# BUTTON CLICKS INTERACTION ROUTERS & HANDLERS
+# ==============================================================================
+@bot.message_handler(func=lambda message: True)
+def handle_menu_navigation(message):
+    user_id = message.from_user.id
+    text = message.text
+    
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("SELECT lang, balance FROM users WHERE user_id=?", (user_id,))
+    user_row = cursor.fetchone()
+    
+    if not user_row:
+        conn.close()
+        return
+    
+    lang, balance = user_row
+    
+    # Global Escape Management
+    if text == '❌ বাতিল করুন / Cancel' or text == '🔙 প্রধান মেনু / Main Menu':
+        user_states.pop(user_id, None)
+        bot.send_message(user_id, msg('main_menu', lang), reply_markup=get_main_keyboard(lang))
+        conn.close()
+        return
+
+    # Process Active Step Chains First
+    if user_id in user_states:
+        state_data = user_states[user_id]
+        state_type = state_data.get('type')
+        
+        if state_type == 'withdraw':
+            try:
+                parts = text.split(maxsplit=1)
+                address = parts[0]
+                amount = float(parts[1])
+                
+                if amount > balance or amount <= 0:
+                    bot.send_message(user_id, msg('with_err', lang))
+                    conn.close()
+                    return
+                
+                cursor.execute("UPDATE users SET balance = balance - ? WHERE user_id=?", (amount, user_id))
+                cursor.execute("INSERT INTO withdraws (user_id, method, amount, address, timestamp) VALUES (?, ?, ?, ?, ?)",
+                               (user_id, state_data['method'], amount, address, int(time.time())))
+                conn.commit()
+                user_states.pop(user_id, None)
+                bot.send_message(user_id, msg('with_success', lang), reply_markup=get_main_keyboard(lang))
+            except Exception:
+                bot.send_message(user_id, "❌ Syntax Error! Format: [Address] [Amount]")
+            conn.close()
+            return
+            
+        elif state_type == 'task_input':
+            # Complete task data processing flow
+            parts = [p.strip() for p in text.split(',')]
+            platform = state_data['platform']
+            
+            # Anti-Spam Gate checking
+            if is_spammer(user_id):
+                bot.send_message(user_id, msg('spam_lock', lang), reply_markup=get_main_keyboard(lang))
+                user_states.pop(user_id, None)
+                conn.close()
+                return
+                
+            # Anti-Fraud Verification Verification Gates
+            if platform == 'YouTube':
+                if len(parts) < 1 or state_data['verification_string'].lower() not in parts[0].lower():
+                    bot.send_message(user_id, msg('proof_err', lang))
+                    cursor.execute("INSERT INTO submissions (user_id, task_main, task_sub, username, password, recovery, status, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                                   (user_id, platform, 'Channel', parts[0] if len(parts)>0 else 'N/A', 'N/A', 'N/A', 'Rejected', int(time.time())))
+                    conn.commit()
+                    conn.close()
+                    return
+                username, password, recovery, tfa, cookies = parts[0], "N/A", "N/A", "N/A", "N/A"
+            else:
+                if len(parts) < 3 or state_data['verification_string'].lower() not in parts[0].lower():
+                    bot.send_message(user_id, msg('proof_err', lang))
+                    cursor.execute("INSERT INTO submissions (user_id, task_main, task_sub, username, password, recovery, status, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                                   (user_id, platform, 'Account', parts[0] if len(parts)>0 else 'N/A', 'N/A', 'N/A', 'Rejected', int(time.time())))
+                    conn.commit()
+                    conn.close()
+                    return
+                
+                username = parts[0]
+                password = parts[1]
+                recovery = parts[2]
+                tfa = parts[3] if len(parts) > 3 else "N/A"
+                cookies = parts[4] if len(parts) > 4 else "N/A"
+                
+                # Check 2FA Locks Requirement conditions dynamically
+                if platform in ['Instagram', 'FB_Hotmail', 'FB_Cookies', 'Twitter', 'TikTok'] and (tfa == "N/A" or len(tfa) < 4):
+                    bot.send_message(user_id, "❌ Error: 2FA Secret Key string is mandatory for this social platform assignment!")
+                    conn.close()
+                    return
+
+            cursor.execute("""
+                INSERT INTO submissions (user_id, task_main, task_sub, username, password, recovery, tfa_key, cookies, status, timestamp)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'Pending', ?)
+            """, (user_id, platform, 'Verification Lock Passed', username, password, recovery, tfa, cookies, int(time.time())))
+            conn.commit()
+            user_states.pop(user_id, None)
+            bot.send_message(user_id, msg('sub_success', lang), reply_markup=get_main_keyboard(lang))
+            conn.close()
+            return
+
+    # Handle Primary Interfaces Choices Routing
+    if text in ['📋 Tasks / কাজ', '📋 Tasks / काम']:
+        cursor.execute("SELECT platform, price, logo FROM rates")
+        rows = cursor.fetchall()
+        markup = types.InlineKeyboardMarkup(row_width=1)
+        for name, price, logo in rows:
+            display_text = f"{logo} {name} - ৳ {price:.2f} BDT"
+            markup.add(types.InlineKeyboardButton(display_text, callback_data=f"play_{name}"))
+        bot.send_message(user_id, msg('task_list', lang), reply_markup=markup)
+        
+    elif text in ['💰 Balance / ব্যালেন্স', '💰 Balance']:
+        usd_r = float(get_setting('usd_rate'))
+        usd_balance = balance / usd_r
+        bot.send_message(user_id, msg('balance', lang).format(balance, usd_balance))
+        
+    elif text in ['💳 Withdraw / উইথড্র', '💳 Withdraw']:
+        markup = types.InlineKeyboardMarkup()
+        markup.row(
+            types.InlineKeyboardButton("📱 Recharge", callback_data="w_Recharge"),
+            types.InlineKeyboardButton("Bkash / Nagad", callback_data="w_MobileBanking")
+        )
+        markup.row(types.InlineKeyboardButton("Binance (USD)", callback_data="w_Binance"))
+        bot.send_message(user_id, msg('with_select', lang), reply_markup=markup)
+        
+    elif text in ['🔗 Invite Link / রেফার', '🔗 Invite Link']:
+        bot_info = bot.get_me()
+        comm = get_setting('ref_commission')
+        
+        # Real-time referral mapping extraction pulling actual Telegram First Names
+        cursor.execute("SELECT first_name FROM users WHERE referred_by=?", (user_id,))
+        refs = cursor.fetchall()
+        ref_list_str = "\n".join([f"🔹 {r[0]}" for r in refs]) if refs else "🚫 No workers referred yet."
+        
+        bot.send_message(user_id, msg('invite', lang).format(comm, bot_info.username, user_id, ref_list_str))
+        
+    elif text in ['📊 My Report / রিপোর্ট', '📊 My Report', '🧾 Proof List / প্রুফ লিস্ট', '🧾 Proof List']:
+        cursor.execute("SELECT task_main, status, timestamp FROM submissions WHERE user_id=? ORDER BY sub_id DESC LIMIT 10", (user_id,))
+        rows = cursor.fetchall()
+        report = "📊 **Your Recent Task Log:**\n\n" if lang == 'EN' else "📊 **আপনার সাম্প্রতিক কাজের খতিয়ান:**\n\n"
+        if not rows:
+            report += "🚫 No tasks submitted yet."
+        for p, stat, ts in rows:
+            report += f"🔹 {p} - `{stat}` ({time.strftime('%d/%m %I:%M %p', time.localtime(ts))})\n"
+        bot.send_message(user_id, report, parse_mode="Markdown")
+        
+    elif text in ['📖 How to Work / ভিডিও গাইড', '📖 How to Work']:
+        url = get_setting('tutorial_video')
+        bot.send_message(user_id, f"📖 Watch our system training guidelines:\n🔗 {url}")
+        
+    elif text in ['📞 Helpline / সাপোর্ট', '📞 Helpline']:
+        cursor.execute("SELECT channel_name, url FROM support_links")
+        links = cursor.fetchall()
+        markup = types.InlineKeyboardMarkup(row_width=1)
+        for name, url in links:
+            markup.add(types.InlineKeyboardButton(text=name, url=url))
+        bot.send_message(user_id, "📞 Click below to access dynamic live help queues:", reply_markup=markup)
+
+    conn.close()
+
+# ==============================================================================
+# INLINE CALLBACK OPERATIONS PROCESSING LOGIC
+# ==============================================================================
+@bot.callback_query_handler(func=lambda call: True)
+def handle_callbacks(call):
+    user_id = call.from_user.id
+    data = call.data
+    
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    
+    if data.startswith("setlang_"):
+        selected_lang = data.split("_")[1]
+        cursor.execute("UPDATE users SET lang=? WHERE user_id=?", (selected_lang, user_id))
+        conn.commit()
+        bot.delete_message(user_id, call.message.message_id)
+        bot.send_message(user_id, msg('welcome', selected_lang), reply_markup=get_main_keyboard(selected_lang))
+        
+    elif data.startswith("w_"):
+        method = data.split("_")[1]
+        cursor.execute("SELECT lang FROM users WHERE user_id=?", (user_id,))
+        lang = cursor.fetchone()[0]
+        user_states[user_id] = {'type': 'withdraw', 'method': method}
+        bot.send_message(user_id, msg('with_input', lang), reply_markup=get_cancel_keyboard(lang))
+        
+    elif data.startswith("play_"):
+        platform = data.split("_")[1]
+        cursor.execute("SELECT lang FROM users WHERE user_id=?", (user_id,))
+        lang = cursor.fetchone()[0]
+        
+        # Generation Logic for simulated microtask identities
+        random_str = ''.join(random.choices(string.ascii_lowercase + string.digits, k=6))
+        generated_email = f"worker.{random_str}@microearn.com"
+        generated_handle = f"@user_{random_str}"
+        generated_pass = ''.join(random.choices(string.ascii_letters + string.digits, k=10))
+        
+        if platform == 'YouTube':
+            inst = f"🎬 **YouTube Target Assignment:**\n\n" \
+                   f"1. Open YouTube app.\n" \
+                   f"2. Create a channel matching handle precisely: `{generated_handle}`\n" \
+                   f"3. Hit completion button below and submit channel handle text."
+            verification = generated_handle
+        else:
+            inst = f"📧 **Credential Creation Protocol for {platform}:**\n\n" \
+                   f"📋 Recommended Email Asset: `{generated_email}`\n" \
+                   f"🔐 Target System Password: `{generated_pass}`\n" \
+                   f"🎒 Alternative Recovery Node: `backup@microearn.com`\n\n" \
+                   f"⚠️ **Submission Rule Format:**\n" \
+                   f"You must paste values separated by commas exactly like:\n" \
+                   f"`[Email/Username], [Password], [Recovery Mail], [2FA Key], [Cookies]`\n\n" \
+                   f"👉 Note: The username string MUST strictly contain: `{random_str}`"
+            verification = random_str
+            
+        user_states[user_id] = {
+            'type': 'task_input',
+            'platform': platform,
+            'verification_string': verification
+        }
+        bot.send_message(user_id, inst, parse_mode="Markdown", reply_markup=get_cancel_keyboard(lang))
+        
+    elif data.startswith("rev_") or data.startswith("rej_"):
+        # Admin Review Processing Logic Engine
+        # Verify access permission rights against admin tables matching sender context
+        cursor.execute("SELECT role FROM admins WHERE admin_id=?", (user_id,))
+        role_row = cursor.fetchone()
+        if not role_row:
+            bot.answer_callback_query(call.id, "❌ Access Control Violation!")
+            conn.close()
+            return
+            
+        action, sub_id = data.split("_")[1], int(data.split("_")[2])
+        cursor.execute("SELECT user_id, task_main, status FROM submissions WHERE sub_id=?", (sub_id,))
+        sub_row = cursor.fetchone()
+        
+        if sub_row and sub_row[2] == 'Pending':
+            worker_id, platform, _ = sub_row
+            if action == 'app':
+                cursor.execute("SELECT price FROM rates WHERE platform=?", (platform,))
+                payout = cursor.fetchone()[0]
+                
+                # Update Worker balance parameter values
+                cursor.execute("UPDATE users SET balance = balance + ? WHERE user_id=?", (payout, worker_id))
+                cursor.execute("UPDATE submissions SET status='Approved' WHERE sub_id=?", (sub_id,))
+                
+                # Dynamic Referral Tier Commission Processing Logic splits payouts
+                cursor.execute("SELECT referred_by FROM users WHERE user_id=?", (worker_id,))
+                ref_id = cursor.fetchone()[0]
+                if ref_id > 0:
+                    ref_bonus = float(get_setting('ref_commission'))
+                    cursor.execute("UPDATE users SET balance = balance + ? WHERE user_id=?", (ref_bonus, ref_id))
+                    try: bot.send_message(ref_id, f"🎁 Referral Bonus Credited: ৳{ref_bonus} BDT from Worker #{worker_id}!")
+                    except: pass
+                    
+                bot.send_message(worker_id, f"✅ Task Approved! Payout of ৳{payout} BDT has been credited to your balance.")
+                bot.edit_message_text(f"✅ Submission #{sub_id} Approved by Moderator.", call.message.chat.id, call.message.message_id)
+            else:
+                cursor.execute("UPDATE submissions SET status='Rejected' WHERE sub_id=?", (sub_id,))
+                bot.send_message(worker_id, "❌ Your account creation data submission was Rejected by administration auditing.")
+                bot.edit_message_text(f"❌ Submission #{sub_id} Rejected by Moderator.", call.message.chat.id, call.message.message_id)
+            conn.commit()
+        else:
+            bot.answer_callback_query(call.id, "❌ Assignment already closed or missing.")
+            
+    elif data.startswith("pay_"):
+        action, w_id = data.split("_")[1], int(data.split("_")[2])
+        cursor.execute("SELECT user_id, amount, status FROM withdraws WHERE w_id=?", (w_id,))
+        w_row = cursor.fetchone()
+        
+        if w_row and w_row[2] == 'Pending':
+            worker_id, amount, _ = w_row
+            if action == 'app':
+                cursor.execute("UPDATE withdraws SET status='Paid', txn_id=? WHERE w_id=?", (f"TXN{int(time.time())}", w_id))
+                bot.send_message(worker_id, f"🎉 Cashout Success! Your payout request of {amount} has been wired.")
+                bot.edit_message_text(f"✅ Cashout #{w_id} updated to PAID.", call.message.chat.id, call.message.message_id)
+            else:
+                cursor.execute("UPDATE users SET balance = balance + ? WHERE user_id=?", (amount, worker_id))
+                cursor.execute("UPDATE withdraws SET status='Rejected' WHERE w_id=?", (w_id,))
+                bot.send_message(worker_id, f"❌ Cashout Rejected! {amount} has been reverted to your balance assets.")
+                bot.edit_message_text(f"❌ Cashout #{w_id} updated to REJECTED.", call.message.chat.id, call.message.message_id)
+            conn.commit()
+
+    conn.close()
+
+# ==============================================================================
+# Enterprise Grade High Security Two-Sheet Automated Data Export Framework
+# HIGHLIGHTED SEGREGATION EXPLANATION:
+# - `/workreport`: Generates a completely safe telemetry log. No raw passwords, 
+#   no 2FA credentials, no raw account cookies are exported. Completely safe for assistants.
+# - `/exportbuyer`: Only executable by Main Owner (7736281687). Compiles raw, premium, 
+#   complete accounts data assets with usernames, passwords, 2FA keys, cookies instantly.
+# ==============================================================================
+
+@bot.message_with_type_handler(commands=['workreport'], content_types=['text'])
+def export_worker_telemetry(message):
+    user_id = message.from_user.id
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("SELECT role FROM admins WHERE admin_id=?", (user_id,))
+    row = cursor.fetchone()
+    
+    if not row:
+        bot.reply_to(message, "❌ Access Control Violation! Unauthorized role permission context.")
+        conn.close()
+        return
+        
+    # Compile 24-hour safe telemetry logs
+    ts_cutoff = int(time.time()) - 86400
+    cursor.execute("""
+        SELECT u.user_id, u.first_name, s.task_main,
+               COUNT(s.sub_id) as total,
+               SUM(CASE WHEN s.status='Approved' THEN 1 ELSE 0 END) as app_cnt,
+               SUM(CASE WHEN s.status='Rejected' THEN 1 ELSE 0 END) as rej_cnt
+        FROM users u
+        JOIN submissions s ON u.user_id = s.user_id
+        WHERE s.timestamp >= ?
+        GROUP BY u.user_id, s.task_main
+    """, (ts_cutoff,))
+    rows = cursor.fetchall()
+    conn.close()
+    
+    filename = "assistant_worker_report.csv"
+    with open(filename, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.writer(f)
+        writer.writerow(['User ID', 'Telegram Name', 'Platform Name', 'Total Submitted', 'Approved Count', 'Rejected Count', 'Success Ratio %'])
+        for r in rows:
+            ratio = (r[4] / r[3] * 100) if r[3] > 0 else 0.0
+            writer.writerow([r[0], r[1], r[2], r[3], r[4], r[5], f"{ratio:.2f}%"])
+            
+    with open(filename, 'rb') as doc:
+        bot.send_document(user_id, doc, caption="📊 Safe Team Worker Telemetry Analytics (Masked Passwords/2FA Keys Asset).")
+    os.remove(filename)
+
+@bot.message_with_type_handler(commands=['exportbuyer'], content_types=['text'])
+def export_premium_buyer_assets(message):
+    user_id = message.from_user.id
+    
+    # SYSTEM CRITICAL OWNER HARD-LOCK AUDIT CHECK
+    if user_id != OWNER_ID:
+        bot.reply_to(message, "🚨 CRITICAL VIOLATION WARNING: This configuration payload download gate is locked entirely to the System Root Owner!")
+        return
+        
+    args = message.text.split()
+    if len(args) < 2:
+        bot.reply_to(message, "✍️ Syntax Layout Parameter Needed: `/exportbuyer [Platform_Name]`\nExample: `/exportbuyer Gmail`")
+        return
+        
+    platform = args[1]
+    ts_cutoff = int(time.time()) - 86400
+    
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT task_main, username, password, recovery, tfa_key, cookies, timestamp
+        FROM submissions
+        WHERE task_main=? AND status='Approved' AND timestamp >= ?
+    """, (platform, ts_cutoff))
+    rows = cursor.fetchall()
+    conn.close()
+    
+    if not rows:
+        bot.reply_to(message, f"❌ No approved batch entries recorded under target platform parameter: {platform} within the trailing 24 hours.")
+        return
+        
+    filename = f"buyer_master_sheet_{platform}.csv"
+    with open(filename, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.writer(f)
+        writer.writerow(['Platform', 'Username/Email', 'Password', 'Recovery Mail', '2FA Secret Key', 'Cookies String', 'Timestamp Approved'])
+        for r in rows:
+            writer.writerow([r[0], r[1], r[2], r[3], r[4], r[5], time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(r[6]))])
+            
+    with open(filename, 'rb') as doc:
+        bot.send_document(OWNER_ID, doc, caption=f"🔑 Master Bulk Account Export for Buyer Distribution: **{platform}** (Complete Credentials Unmasked).")
+    os.remove(filename)
+
+# ==============================================================================
+# SUPREME COMMAND FLEET FOR OPERATIONS MANAGEMENT & ADMINISTRATIVE CONTROLS
+# ==============================================================================
+@bot.message_with_type_handler(commands=['addadmin'], content_types=['text'])
+def add_admin_privilege(message):
+    if message.from_user.id != OWNER_ID: return
+    try:
+        target_id = int(message.text.split()[1])
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        cursor.execute("INSERT OR IGNORE INTO admins (admin_id, assigned_by, role) VALUES (?, ?, 'Assistant')", (target_id, OWNER_ID))
+        conn.commit()
+        conn.close()
+        bot.reply_to(message, f"✅ Assistant ID {target_id} successfully added to shift moderation lists.")
+    except: bot.reply_to(message, "Syntax: `/addadmin [ID]`")
+
+@bot.message_with_type_handler(commands=['deladmin'], content_types=['text'])
+def revoke_admin_privilege(message):
+    if message.from_user.id != OWNER_ID: return
+    try:
+        target_id = int(message.text.split()[1])
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM admins WHERE admin_id=? AND role != 'Owner'", (target_id,))
+        conn.commit()
+        conn.close()
+        bot.reply_to(message, f"❌ Moderation access rights fully revoked from Assistant ID {target_id}.")
+    except: bot.reply_to(message, "Syntax: `/deladmin [ID]`")
+
+@bot.message_with_type_handler(commands=['addtask'], content_types=['text'])
+def add_custom_task_configuration(message):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("SELECT role FROM admins WHERE admin_id=?", (message.from_user.id,))
+    if not cursor.fetchone(): 
+        conn.close()
+        return
+    try:
+        parts = message.text.split(maxsplit=3)
+        name, payout, logo = parts[1], float(parts[2]), parts[3]
+        cursor.execute("INSERT OR REPLACE INTO rates (platform, price, logo) VALUES (?, ?, ?)", (name, payout, logo))
+        conn.commit()
+        bot.reply_to(message, f"✅ Dynamic Task Configuration Live! Platform: {logo} {name} at ৳{payout} BDT.")
+    except: bot.reply_to(message, "Syntax: `/addtask [Name] [Payout_BDT] [Emoji_Logo]`")
+    conn.close()
+
+@bot.message_with_type_handler(commands=['addsupport'], content_types=['text'])
+def append_support_link(message):
+    if message.from_user.id != OWNER_ID: return
+    try:
+        parts = message.text.split(maxsplit=2)
+        name, url = parts[1], parts[2]
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        cursor.execute("INSERT INTO support_links (channel_name, url) VALUES (?, ?)", (name, url))
+        conn.commit()
+        conn.close()
+        bot.reply_to(message, f"✅ Live Support Channel linked: {name}")
+    except: bot.reply_to(message, "Syntax: `/addsupport [Display_Name] [URL_Link]`")
+
+@bot.message_with_type_handler(commands=['listsupport'], content_types=['text'])
+def display_support_links(message):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("SELECT link_id, channel_name, url FROM support_links")
+    rows = cursor.fetchall()
+    conn.close()
+    out = "📋 **Active System Support Assets Matrix:**\n\n"
+    for r in rows: out += f"🆔 `{r[0]}`: {r[1]} ➡️ {r[2]}\n"
+    bot.reply_to(message, out, parse_mode="Markdown")
+
+@bot.message_with_type_handler(commands=['delsupport'], content_types=['text'])
+def remove_support_link(message):
+    if message.from_user.id != OWNER_ID: return
+    try:
+        link_id = int(message.text.split()[1])
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM support_links WHERE link_id=?", (link_id,))
+        conn.commit()
+        conn.close()
+        bot.reply_to(message, f"❌ Support Channel ID {link_id} removed from Helpline matrix matrix mappings.")
+    except: bot.reply_to(message, "Syntax: `/delsupport [Numeric_Link_ID]`")
+
+@bot.message_with_type_handler(commands=['setusd'], content_types=['text'])
+def set_usd_scale(message):
+    if message.from_user.id != OWNER_ID: return
+    try:
+        val = float(message.text.split()[1])
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        cursor.execute("UPDATE dynamic_settings SET value=? WHERE key='usd_rate'", (str(val),))
+        conn.commit()
+        conn.close()
+        bot.reply_to(message, f"✅ Global currency scaling matrix value adjusted to: $1 USD = ৳{val} BDT")
+    except: pass
+
+@bot.message_with_type_handler(commands=['setref'], content_types=['text'])
+def set_ref_scale(message):
+    if message.from_user.id != OWNER_ID: return
+    try:
+        val = float(message.text.split()[1])
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        cursor.execute("UPDATE dynamic_settings SET value=? WHERE key='ref_commission'", (str(val),))
+        conn.commit()
+        conn.close()
+        bot.reply_to(message, f"✅ Lifetime referral rewards split payouts calibrated to: ৳{val} BDT")
+    except: pass
+
+@bot.message_with_type_handler(commands=['setvideo'], content_types=['text'])
+def set_video_guide(message):
+    if message.from_user.id != OWNER_ID: return
+    try:
+        url = message.text.split()[1]
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        cursor.execute("UPDATE dynamic_settings SET value=? WHERE key='tutorial_video'", (url,))
+        conn.commit()
+        conn.close()
+        bot.reply_to(message, "✅ Media reference configuration link updated safely.")
+    except: pass
+
+@bot.message_with_type_handler(commands=['stats'], content_types=['text'])
+def display_business_insights(message):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("SELECT role FROM admins WHERE admin_id=?", (message.from_user.id,))
+    if not cursor.fetchone():
+        conn.close()
+        return
+    cursor.execute("SELECT COUNT(*) FROM users")
+    tot_w = cursor.fetchone()[0]
+    cursor.execute("SELECT COUNT(*) FROM submissions WHERE status='Pending'")
+    p_tasks = cursor.fetchone()[0]
+    cursor.execute("SELECT COUNT(*), SUM(amount) FROM withdraws WHERE status='Pending'")
+    w_row = cursor.fetchone()
+    p_w_cnt = w_row[0]
+    p_w_amt = w_row[1] if w_row[1] else 0.0
+    conn.close()
+    
+    out = f"📊 **Enterprise Dashboard Financial Summary Insights:**\n\n" \
+          f"👥 Total Active Workers Base: `{tot_w}` users\n" \
+          f"📥 Pending Account Review Audit Tasks Queue: `{p_tasks}` instances\n" \
+          f"💳 Pending Payout Settlements: `{p_w_cnt}` cases (Totaling: ৳`{p_w_amt:.2f}` BDT)"
+    bot.reply_to(message, out, parse_mode="Markdown")
+
+@bot.message_with_type_handler(commands=['review'], content_types=['text'])
+def review_pending_submissions(message):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("SELECT role FROM admins WHERE admin_id=?", (message.from_user.id,))
+    if not cursor.fetchone():
+        conn.close()
+        return
+        
+    cursor.execute("SELECT sub_id, user_id, task_main, username, password, recovery, tfa_key, cookies FROM submissions WHERE status='Pending' LIMIT 1")
+    row = cursor.fetchone()
+    conn.close()
+    
+    if not row:
+        bot.reply_to(message, "🎉 Task audit logs cleared! No entries pending administrative verification.")
+        return
+        
+    sub_id, u_id, plat, user, pwd, rec, tfa, cook = row
+    info = f"📥 **Audit Task Entry Record #{sub_id}**\n\n" \
+           f"👤 Worker Target Node ID: `{u_id}`\n" \
+           f"🎯 Platform Platform Context: `{plat}`\n" \
+           f"📧 Username/Email: `{user}`\n" \
+           f"🔐 Account Password: `{pwd}`\n" \
+           f"🎒 Recovery Node String: `{rec}`\n" \
+           f"🔑 2FA Security Token: `{tfa}`\n" \
+           f"🍪 Cookies Context: `{cook}`"
+           
+    markup = types.InlineKeyboardMarkup()
+    markup.row(
+        types.InlineKeyboardButton("🟢 Approve", callback_data=f"rev_app_{sub_id}"),
+        types.InlineKeyboardButton("🔴 Reject", callback_data=f"rev_rej_{sub_id}")
+    )
+    bot.send_message(message.chat.id, info, parse_mode="Markdown", reply_markup=markup)
+
+@bot.message_with_type_handler(commands=['payreview'], content_types=['text'])
+def review_pending_withdrawals(message):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("SELECT role FROM admins WHERE admin_id=?", (message.from_user.id,))
+    if not cursor.fetchone():
+        conn.close()
+        return
+        
+    cursor.execute("SELECT w_id, user_id, method, amount, address FROM withdraws WHERE status='Pending' LIMIT 1")
+    row = cursor.fetchone()
+    conn.close()
+    
+    if not row:
+        bot.reply_to(message, "🎉 Payout requests pipeline empty. All liquid cash settlements deployed.")
+        return
+        
+    w_id, u_id, method, amount, addr = row
+    info = f"💳 **Cashout Settlement Validation Request #{w_id}**\n\n" \
+           f"👤 Worker Identity Target: `{u_id}`\n" \
+           f"📲 Channel Routing Engine: `{method}`\n" \
+           f"💰 Nominal Amount Requested: ৳`{amount:.2f}` BDT\n" \
+           f"📍 Beneficiary End Node Address: `{addr}`"
+           
+    markup = types.InlineKeyboardMarkup()
+    markup.row(
+        types.InlineKeyboardButton("🟢 Mark Paid", callback_data=f"pay_app_{w_id}"),
+        types.InlineKeyboardButton("🔴 Decline Refund", callback_data=f"pay_rej_{w_id}")
+    )
+    bot.send_message(message.chat.id, info, parse_mode="Markdown", reply_markup=markup)
+
+# ==============================================================================
+# RUNTIME CRISIS MANAGEMENT ENGINE CLASH CLEANUP & LONG POLLING ENGINES BOOT
+# ==============================================================================
+if __name__ == "__main__":
+    init_db()
+    print("🚀 Database infrastructure successfully seeded and synchronized.")
+    print("💥 Initializing network queues. Wiping dangling crash logs...")
+    bot.delete_webhook(drop_pending_updates=True)
+    print("👑 System Server fully operational. Deploying infinity-long-polling routines.")
+    bot.infinity_polling(timeout=60, long_polling_timeout=30)
